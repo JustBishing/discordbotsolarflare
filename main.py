@@ -1,5 +1,6 @@
 import os
 import random
+import json
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -18,6 +19,58 @@ BOT = commands.Bot(command_prefix="!", intents=INTENTS)
 DEFAULT_GOON_PHRASES = [
     "Good boy"
 ]
+
+STARTING_BALANCE = 1000
+WALLET_FILE = os.path.join(os.path.dirname(__file__), "wallets.json")
+
+
+class WalletManager:
+    """Simple file-backed wallet store."""
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = file_path
+        self._wallets = self._load()
+
+    def _load(self) -> dict:
+        if not os.path.exists(self.file_path):
+            return {}
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save(self) -> None:
+        try:
+            with open(self.file_path, "w", encoding="utf-8") as handle:
+                json.dump(self._wallets, handle, indent=2)
+        except OSError as error:
+            print(f"Failed to save wallets: {error}")
+
+    def ensure_user(self, user_id: int) -> None:
+        key = str(user_id)
+        if key not in self._wallets:
+            self._wallets[key] = STARTING_BALANCE
+            self._save()
+
+    def get_balance(self, user_id: int) -> int:
+        key = str(user_id)
+        if key not in self._wallets:
+            return STARTING_BALANCE
+        return int(self._wallets[key])
+
+    def adjust_balance(self, user_id: int, delta: int) -> int:
+        key = str(user_id)
+        self.ensure_user(user_id)
+        self._wallets[key] = int(self._wallets.get(key, STARTING_BALANCE) + delta)
+        self._save()
+        return self._wallets[key]
+
+    def all_balances(self) -> dict:
+        return self._wallets.copy()
+
+
+WALLETS = WalletManager(WALLET_FILE)
 
 
 def _load_goon_phrases(file_name: str = "mai_gifs.txt") -> List[str]:
@@ -43,7 +96,7 @@ GOON_PHRASES = _load_goon_phrases()
 class BlackjackGame:
     """Blackjack game logic with single split support."""
 
-    def __init__(self) -> None:
+    def __init__(self, bet: int) -> None:
         self.deck = self._build_deck()
         self.player_hands: List[List[str]] = [[self._draw_card(), self._draw_card()]]
         self.dealer_hand: List[str] = [self._draw_card(), self._draw_card()]
@@ -53,6 +106,9 @@ class BlackjackGame:
         self.current_hand_index = 0
         self.split_used = False
         self.hand_statuses: List[str] = ["playing"]  # playing, bust, stood, win, lose, push, blackjack
+        self.hand_bets: List[int] = [bet]
+        self.hand_doubled: List[bool] = [False]
+        self.settled = False
         self._check_initial_blackjack()
 
     @staticmethod
@@ -156,9 +212,37 @@ class BlackjackGame:
             [second, self._draw_card()],
         ]
         self.hand_statuses = ["playing", "playing"]
+        original_bet = self.hand_bets[0]
+        self.hand_bets = [original_bet, original_bet]
+        self.hand_doubled = [False, False]
         self.current_hand_index = 0
         self.split_used = True
         return True
+
+    def can_double(self) -> bool:
+        if self.finished:
+            return False
+        if self.hand_statuses[self.current_hand_index] != "playing":
+            return False
+        hand = self.player_hands[self.current_hand_index]
+        if len(hand) != 2:
+            return False
+        return not self.hand_doubled[self.current_hand_index]
+
+    def double_down(self) -> None:
+        """Double the current hand bet, draw one card, then stand."""
+        if not self.can_double():
+            return
+        self.hand_bets[self.current_hand_index] *= 2
+        self.hand_doubled[self.current_hand_index] = True
+        hand = self.player_hands[self.current_hand_index]
+        hand.append(self._draw_card())
+        if self.hand_total(self.current_hand_index) > 21:
+            self.hand_statuses[self.current_hand_index] = "bust"
+        else:
+            self.hand_statuses[self.current_hand_index] = "stood"
+        self._advance_hand()
+        self._finalize_if_done()
 
     def player_hit(self) -> None:
         if self.finished:
@@ -232,11 +316,13 @@ class BlackjackGame:
             cards = " ".join(self._fmt_card(card) for card in hand)
             total = self.hand_total(idx)
             status = self.hand_statuses[idx]
+            bet = self.hand_bets[idx]
             if self.finished:
                 label = status.upper()
             else:
                 label = "PLAYING" if idx == self.current_hand_index else status.upper()
-            lines.append(f"Hand {idx + 1} ({total}) [{label}]: {cards}")
+            doubled = " x2" if self.hand_doubled[idx] else ""
+            lines.append(f"Hand {idx + 1} (${bet}{doubled}) ({total}) [{label}]: {cards}")
 
         if reveal_dealer:
             dealer_cards = " ".join(self._fmt_card(card) for card in self.dealer_hand)
@@ -255,14 +341,39 @@ class BlackjackGame:
 
         return "\n".join(lines)
 
+    def settle_payout(self) -> int:
+        """Return total payout after bets have been placed up front."""
+        if self.settled:
+            return 0
+        payout = 0
+        for bet, status in zip(self.hand_bets, self.hand_statuses):
+            if status in {"win", "blackjack"}:
+                payout += bet * 2
+            elif status == "push":
+                payout += bet
+        self.settled = True
+        return payout
+
+    def forfeit(self) -> None:
+        if self.finished:
+            return
+        for idx, status in enumerate(self.hand_statuses):
+            if status == "playing":
+                self.hand_statuses[idx] = "lose"
+        self.finished = True
+        self.result = "Game timed out. Bets forfeited."
+
 
 class BlackjackView(discord.ui.View):
     """Interactive blackjack buttons for a single player."""
 
-    def __init__(self, game: BlackjackGame, player: discord.Member) -> None:
+    def __init__(
+        self, game: BlackjackGame, player: discord.Member, wallets: WalletManager
+    ) -> None:
         super().__init__(timeout=90)
         self.game = game
         self.player_id = player.id
+        self.wallets = wallets
         self.message: Optional[discord.Message] = None
         self._update_buttons()
 
@@ -276,11 +387,11 @@ class BlackjackView(discord.ui.View):
 
     async def on_timeout(self) -> None:
         if self.message and not self.game.finished:
-            for child in self.children:
-                child.disabled = True
+            self.game.forfeit()
+            self._update_buttons()
             try:
                 await self.message.edit(
-                    content=f"{self.game.render_state(reveal_dealer=False)}\n\nGame timed out.",
+                    content=self.game.render_state(reveal_dealer=True),
                     view=self,
                 )
             except discord.HTTPException:
@@ -290,6 +401,17 @@ class BlackjackView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
+    async def _settle_if_done(self, interaction: discord.Interaction) -> None:
+        if self.game.finished and not self.game.settled:
+            payout = self.game.settle_payout()
+            if payout:
+                new_balance = self.wallets.adjust_balance(self.player_id, payout)
+                await interaction.followup.send(
+                    f"You won ${payout}. New balance: ${new_balance}."
+                )
+            else:
+                await interaction.followup.send("No winnings this time.")
+
     def _update_buttons(self) -> None:
         for child in self.children:
             if not isinstance(child, discord.ui.Button):
@@ -298,6 +420,8 @@ class BlackjackView(discord.ui.View):
                 child.disabled = True
             elif child.label == "Split":
                 child.disabled = not self.game.can_split()
+            elif child.label == "Double Down":
+                child.disabled = not self.game.can_double()
             else:
                 child.disabled = False
 
@@ -313,6 +437,7 @@ class BlackjackView(discord.ui.View):
             content=self.game.render_state(reveal_dealer=reveal),
             view=self,
         )
+        await self._settle_if_done(interaction)
 
     @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
     async def stand(
@@ -325,15 +450,54 @@ class BlackjackView(discord.ui.View):
             content=self.game.render_state(reveal_dealer=self.game.finished),
             view=self,
         )
+        await self._settle_if_done(interaction)
+
+    @discord.ui.button(label="Double Down", style=discord.ButtonStyle.success, row=1)
+    async def double_down(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self.game.can_double():
+            await interaction.response.send_message(
+                "You cannot double right now.", ephemeral=True
+            )
+            return
+
+        bet_needed = self.game.hand_bets[self.game.current_hand_index]
+        balance = self.wallets.get_balance(self.player_id)
+        if balance < bet_needed:
+            await interaction.response.send_message(
+                f"Not enough funds to double. Need ${bet_needed}.", ephemeral=True
+            )
+            return
+
+        self.wallets.adjust_balance(self.player_id, -bet_needed)
+        self.game.double_down()
+        self._update_buttons()
+
+        await interaction.response.edit_message(
+            content=self.game.render_state(reveal_dealer=self.game.finished),
+            view=self,
+        )
+        await self._settle_if_done(interaction)
 
     @discord.ui.button(label="Split", style=discord.ButtonStyle.secondary, row=1)
     async def split_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        split_cost = self.game.hand_bets[0]
+        balance = self.wallets.get_balance(self.player_id)
+        if balance < split_cost:
+            await interaction.response.send_message(
+                f"Not enough funds to split. Need ${split_cost}.", ephemeral=True
+            )
+            return
+        self.wallets.adjust_balance(self.player_id, -split_cost)
         if not self.game.split():
             await interaction.response.send_message(
                 "Split is not available right now.", ephemeral=True
             )
+            # Refund since split failed
+            self.wallets.adjust_balance(self.player_id, split_cost)
             return
 
         self._update_buttons()
@@ -342,6 +506,125 @@ class BlackjackView(discord.ui.View):
             content=self.game.render_state(reveal_dealer=False),
             view=self,
         )
+        await self._settle_if_done(interaction)
+
+
+def _bet_options(balance: int) -> List[discord.SelectOption]:
+    """Build bet options up to the user's balance."""
+    base = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+    options = [amt for amt in base if amt <= balance]
+    if balance not in options:
+        options.append(balance)  # all-in option
+    # Deduplicate and sort
+    unique = sorted(set(options))
+    select_options = []
+    for amt in unique:
+        label = f"${amt}"
+        if amt == balance:
+            label += " (All-in)"
+        select_options.append(discord.SelectOption(label=label, value=str(amt)))
+    return select_options
+
+
+class BetSelect(discord.ui.Select):
+    def __init__(self, parent: "BetSelectionView", balance: int) -> None:
+        self.parent_view = parent
+        options = _bet_options(balance)[:25]  # Discord limit
+        super().__init__(
+            placeholder="Pick your bet",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.parent_view.user_id:
+            await interaction.response.send_message(
+                "This menu isn't for you.", ephemeral=True
+            )
+            return
+        bet = int(self.values[0])
+        await self.parent_view.start_game(interaction, bet)
+
+
+class BetSelectionView(discord.ui.View):
+    """Bet chooser that then starts blackjack."""
+
+    def __init__(
+        self, user: discord.Member, balance: int, ctx: commands.Context
+    ) -> None:
+        super().__init__(timeout=60)
+        self.user_id = user.id
+        self.balance = balance
+        self.ctx = ctx
+        self.message: Optional[discord.Message] = None
+        self.add_item(BetSelect(self, balance))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This menu isn't for you.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(content="Bet selection timed out.", view=self)
+            except Exception:
+                pass
+
+    async def start_game(self, interaction: discord.Interaction, bet: int) -> None:
+        # Stop further interactions on this view
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+
+        balance = WALLETS.get_balance(self.user_id)
+        if bet <= 0:
+            await interaction.response.edit_message(
+                content="Bet must be greater than 0.", view=self
+            )
+            return
+        if bet > balance:
+            await interaction.response.edit_message(
+                content=f"Insufficient funds. Balance: ${balance}.", view=self
+            )
+            return
+
+        WALLETS.adjust_balance(self.user_id, -bet)
+        game = BlackjackGame(bet)
+
+        # Update the bet selection message to lock the bet.
+        await interaction.response.edit_message(
+            content=f"Bet locked at ${bet}. Balance: ${WALLETS.get_balance(self.user_id)}.",
+            view=None,
+        )
+
+        # If blackjack is dealt immediately, resolve without buttons.
+        if game.finished:
+            await interaction.followup.send(game.render_state(reveal_dealer=True))
+            payout = game.settle_payout()
+            if payout:
+                new_balance = WALLETS.adjust_balance(self.user_id, payout)
+                await interaction.followup.send(
+                    f"You won ${payout}. New balance: ${new_balance}."
+                )
+            else:
+                await interaction.followup.send(
+                    f"No winnings. Balance: ${WALLETS.get_balance(self.user_id)}."
+                )
+            return
+
+        view = BlackjackView(game, interaction.user, WALLETS)
+        message = await interaction.followup.send(
+            game.render_state(reveal_dealer=False), view=view
+        )
+        view.message = message
+        self.message = message
 
 
 def _collect_assignees(*members: Optional[discord.Member]) -> List[discord.Member]:
@@ -369,19 +652,39 @@ async def mai(ctx: commands.Context) -> None:
     await ctx.send(random.choice(GOON_PHRASES))
 
 
-@BOT.command(name="blackjack", help="Play blackjack; win to earn goon phrase(s).")
+@BOT.command(name="blackjack", help="Play blackjack; bet your balance and settle winnings.")
 async def blackjack(ctx: commands.Context) -> None:
-    """Start a blackjack game; only winners get goon phrase(s)."""
-    game = BlackjackGame()
-
-    # If blackjack is dealt immediately, resolve without buttons.
-    if game.finished:
-        await ctx.send(game.render_state(reveal_dealer=True))
+    """Start a blackjack game with a bet chosen from a menu."""
+    user_id = ctx.author.id
+    WALLETS.ensure_user(user_id)
+    balance = WALLETS.get_balance(user_id)
+    if balance <= 0:
+        await ctx.send("You are out of funds. No bets available.")
         return
 
-    view = BlackjackView(game, ctx.author)
-    message = await ctx.send(game.render_state(reveal_dealer=False), view=view)
+    view = BetSelectionView(ctx.author, balance, ctx)
+    message = await ctx.send(
+        f"Balance: ${balance}. Choose your bet to start blackjack.",
+        view=view,
+    )
     view.message = message
+
+
+@BOT.command(name="leaderboard", help="Show top wallet balances.")
+async def leaderboard(ctx: commands.Context) -> None:
+    """Display the richest users."""
+    balances = WALLETS.all_balances()
+    if not balances:
+        await ctx.send("No wallets yet.")
+        return
+
+    top = sorted(balances.items(), key=lambda item: item[1], reverse=True)[:10]
+    lines = []
+    for idx, (user_id, amount) in enumerate(top, start=1):
+        mention = f"<@{user_id}>"
+        lines.append(f"{idx}. {mention}: ${amount}")
+
+    await ctx.send("Top balances:\n" + "\n".join(lines))
 
 
 @BOT.tree.command(
