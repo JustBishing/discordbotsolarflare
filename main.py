@@ -366,9 +366,22 @@ async def on_ready() -> None:
     print(f"Logged in as {BOT.user} (ID: {BOT.user.id})")
 
 
-@BOT.command(name="mai", help="Play blackjack; win to earn a goon phrase.")
+@BOT.command(name="mai", help="Send a goon phrase (Mai Sakurajima role required).")
 async def mai(ctx: commands.Context) -> None:
-    """Start a blackjack game; only winners get a goon phrase."""
+    """Send a goon phrase if the caller has the Mai Sakurajima role."""
+    required_role = "Mai Sakurajima"
+    member = ctx.author
+    has_role = any(role.name == required_role for role in getattr(member, "roles", []))
+    if not has_role:
+        await ctx.send("you arent a good enough boy")
+        return
+
+    await ctx.send(random.choice(GOON_PHRASES))
+
+
+@BOT.command(name="blackjack", help="Play blackjack; win to earn goon phrase(s).")
+async def blackjack(ctx: commands.Context) -> None:
+    """Start a blackjack game; only winners get goon phrase(s)."""
     game = BlackjackGame()
 
     # If blackjack is dealt immediately, resolve without buttons.
