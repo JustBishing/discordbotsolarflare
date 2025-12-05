@@ -681,8 +681,9 @@ async def leaderboard(ctx: commands.Context) -> None:
     top = sorted(balances.items(), key=lambda item: item[1], reverse=True)[:10]
     lines = []
     for idx, (user_id, amount) in enumerate(top, start=1):
-        mention = f"<@{user_id}>"
-        lines.append(f"{idx}. {mention}: ${amount}")
+        member = ctx.guild.get_member(int(user_id)) if ctx.guild else None
+        name = member.display_name if member else f"User {user_id}"
+        lines.append(f"{idx}. {name}: ${amount}")
 
     await ctx.send("Top balances:\n" + "\n".join(lines))
 
