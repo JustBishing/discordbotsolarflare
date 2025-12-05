@@ -149,7 +149,7 @@ class BlackjackGame:
             self.result = "You win!"
         elif player == dealer:
             self.player_won = False
-            self.result = "Push. No goon phrase this time."
+            self.result = "Push."
         else:
             self.player_won = False
             self.result = "Dealer wins."
