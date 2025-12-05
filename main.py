@@ -41,15 +41,18 @@ GOON_PHRASES = _load_goon_phrases()
 
 
 class BlackjackGame:
-    """Simple blackjack game logic for a single player vs. dealer."""
+    """Blackjack game logic with single split support."""
 
     def __init__(self) -> None:
         self.deck = self._build_deck()
-        self.player_hand: List[str] = [self._draw_card(), self._draw_card()]
+        self.player_hands: List[List[str]] = [[self._draw_card(), self._draw_card()]]
         self.dealer_hand: List[str] = [self._draw_card(), self._draw_card()]
         self.finished = False
-        self.player_won = False
+        self.winning_hand_count = 0
         self.result = ""
+        self.current_hand_index = 0
+        self.split_used = False
+        self.hand_statuses: List[str] = ["playing"]  # playing, bust, stood, win, lose, push, blackjack
         self._check_initial_blackjack()
 
     @staticmethod
@@ -69,6 +72,10 @@ class BlackjackGame:
     def _fmt_card(card: str) -> str:
         suit_symbols = {"S": "♠️", "H": "♥️", "D": "♦️", "C": "♣️"}
         return f"{card[:-1]}{suit_symbols.get(card[-1], '')}"
+
+    @staticmethod
+    def _card_rank(card: str) -> str:
+        return card[:-1]
 
     @staticmethod
     def _card_value(card: str) -> int:
@@ -95,67 +102,142 @@ class BlackjackGame:
 
         return total
 
-    @property
-    def player_total(self) -> int:
-        return self._hand_value(self.player_hand)
+    @staticmethod
+    def _is_blackjack(hand: List[str]) -> bool:
+        return len(hand) == 2 and BlackjackGame._hand_value(hand) == 21
+
+    def hand_total(self, index: int) -> int:
+        return self._hand_value(self.player_hands[index])
 
     @property
     def dealer_total(self) -> int:
         return self._hand_value(self.dealer_hand)
 
     def _check_initial_blackjack(self) -> None:
-        if self.player_total == 21 and self.dealer_total == 21:
-            self.finished = True
+        player_hand = self.player_hands[0]
+        player_blackjack = self._is_blackjack(player_hand)
+        dealer_blackjack = self._is_blackjack(self.dealer_hand)
+
+        if player_blackjack and dealer_blackjack:
+            self.hand_statuses[0] = "push"
             self.result = "Both you and the dealer have blackjack. Push."
+            self.finished = True
             return
 
-        if self.player_total == 21:
-            self.finished = True
-            self.player_won = True
+        if player_blackjack:
+            self.hand_statuses[0] = "blackjack"
+            self.winning_hand_count = 1
             self.result = "Blackjack! You win."
+            self.finished = True
             return
 
-        if self.dealer_total == 21:
-            self.finished = True
-            self.player_won = False
+        if dealer_blackjack:
+            self.hand_statuses[0] = "lose"
             self.result = "Dealer has blackjack. You lose."
+            self.finished = True
+
+    def can_split(self) -> bool:
+        if self.finished or self.split_used:
+            return False
+        if len(self.player_hands) != 1:
+            return False
+        hand = self.player_hands[0]
+        if len(hand) != 2:
+            return False
+        return self._card_rank(hand[0]) == self._card_rank(hand[1])
+
+    def split(self) -> bool:
+        if not self.can_split():
+            return False
+        hand = self.player_hands[0]
+        first, second = hand
+        self.player_hands = [
+            [first, self._draw_card()],
+            [second, self._draw_card()],
+        ]
+        self.hand_statuses = ["playing", "playing"]
+        self.current_hand_index = 0
+        self.split_used = True
+        return True
 
     def player_hit(self) -> None:
-        self.player_hand.append(self._draw_card())
-        if self.player_total > 21:
-            self.finished = True
-            self.result = "Bust! You lose."
+        if self.finished:
+            return
+        hand = self.player_hands[self.current_hand_index]
+        hand.append(self._draw_card())
+        if self.hand_total(self.current_hand_index) > 21:
+            self.hand_statuses[self.current_hand_index] = "bust"
+            self._advance_hand()
+            self._finalize_if_done()
 
     def player_stand(self) -> None:
-        self._dealer_play()
-        self._determine_winner()
+        if self.finished:
+            return
+        self.hand_statuses[self.current_hand_index] = "stood"
+        self._advance_hand()
+        self._finalize_if_done()
 
     def _dealer_play(self) -> None:
         while self.dealer_total < 17:
             self.dealer_hand.append(self._draw_card())
 
-    def _determine_winner(self) -> None:
-        self.finished = True
-        player = self.player_total
-        dealer = self.dealer_total
+    def _advance_hand(self) -> None:
+        while self.current_hand_index < len(self.player_hands):
+            if self.hand_statuses[self.current_hand_index] == "playing":
+                return
+            self.current_hand_index += 1
 
-        if dealer > 21:
-            self.player_won = True
-            self.result = "Dealer busts. You win!"
+    def _finalize_if_done(self) -> None:
+        if any(status == "playing" for status in self.hand_statuses):
             return
+        # Dealer plays only if at least one hand is not bust.
+        if any(status != "bust" for status in self.hand_statuses):
+            self._dealer_play()
+            for idx, status in enumerate(self.hand_statuses):
+                if status == "bust":
+                    continue
+                player = self.hand_total(idx)
+                dealer = self.dealer_total
+                if player > 21:
+                    self.hand_statuses[idx] = "bust"
+                elif dealer > 21 or player > dealer:
+                    self.hand_statuses[idx] = "win"
+                elif player == dealer:
+                    self.hand_statuses[idx] = "push"
+                else:
+                    self.hand_statuses[idx] = "lose"
 
-        if player > dealer:
-            self.player_won = True
-            self.result = "You win!"
-        elif player == dealer:
-            self.player_won = False
-            self.result = "Push."
+        self.finished = True
+        self.winning_hand_count = sum(
+            1 for status in self.hand_statuses if status in {"win", "blackjack"}
+        )
+        pushes = sum(1 for status in self.hand_statuses if status == "push")
+
+        total_hands = len(self.hand_statuses)
+        if self.winning_hand_count == total_hands:
+            self.result = "You win all hands!"
+        elif self.winning_hand_count > 0:
+            self.result = f"You win {self.winning_hand_count} hand(s)."
+        elif pushes == total_hands:
+            self.result = "All hands push."
+        elif pushes > 0:
+            self.result = f"No wins. Pushes: {pushes}."
         else:
-            self.player_won = False
             self.result = "Dealer wins."
 
     def render_state(self, reveal_dealer: bool) -> str:
-        player_cards = " ".join(self._fmt_card(card) for card in self.player_hand)
+        lines = ["win this game like a good boy.", "```"]
+
+        for idx, hand in enumerate(self.player_hands):
+            cards = " ".join(self._fmt_card(card) for card in hand)
+            total = self.hand_total(idx)
+            status = self.hand_statuses[idx]
+            if self.finished:
+                label = status.upper()
+            else:
+                label = "PLAYING" if idx == self.current_hand_index else status.upper()
+            lines.append(f"Hand {idx + 1} ({total}) [{label}]: {cards}")
+
         if reveal_dealer:
             dealer_cards = " ".join(self._fmt_card(card) for card in self.dealer_hand)
             dealer_label = f"Dealer ({self.dealer_total}): {dealer_cards}"
@@ -163,20 +245,15 @@ class BlackjackGame:
             dealer_cards = f"{self._fmt_card(self.dealer_hand[0])} ??"
             dealer_label = f"Dealer showing: {dealer_cards}"
 
-        body = (
-            "win this game like a good boy.\n"
-            "```\n"
-            f"Your ({self.player_total}): {player_cards}\n"
-            f"{dealer_label}\n"
-            "```"
-        )
+        lines.append(dealer_label)
+        lines.append("```")
 
         if self.finished:
-            body += f"\n{self.result}"
+            lines.append(self.result)
         else:
-            body += "\nHit or Stand with the buttons below."
+            lines.append("Hit, Stand, or Split (if available) with the buttons below.")
 
-        return body
+        return "\n".join(lines)
 
 
 class BlackjackView(discord.ui.View):
@@ -187,6 +264,7 @@ class BlackjackView(discord.ui.View):
         self.game = game
         self.player_id = player.id
         self.message: Optional[discord.Message] = None
+        self._update_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.player_id:
@@ -212,37 +290,68 @@ class BlackjackView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
+    def _update_buttons(self) -> None:
+        for child in self.children:
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if self.game.finished:
+                child.disabled = True
+            elif child.label == "Split":
+                child.disabled = not self.game.can_split()
+            else:
+                child.disabled = False
+
+    async def _send_rewards(self, interaction: discord.Interaction) -> None:
+        for _ in range(self.game.winning_hand_count):
+            await interaction.followup.send(random.choice(GOON_PHRASES))
+
     @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
     async def hit(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         self.game.player_hit()
+        self._update_buttons()
         reveal = self.game.finished
-        if self.game.finished:
-            self._disable_buttons()
 
         await interaction.response.edit_message(
             content=self.game.render_state(reveal_dealer=reveal),
             view=self,
         )
 
-        if self.game.finished and self.game.player_won:
-            await interaction.followup.send(random.choice(GOON_PHRASES))
+        if self.game.finished and self.game.winning_hand_count:
+            await self._send_rewards(interaction)
 
     @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
     async def stand(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         self.game.player_stand()
-        self._disable_buttons()
+        self._update_buttons()
 
         await interaction.response.edit_message(
-            content=self.game.render_state(reveal_dealer=True),
+            content=self.game.render_state(reveal_dealer=self.game.finished),
             view=self,
         )
 
-        if self.game.player_won:
-            await interaction.followup.send(random.choice(GOON_PHRASES))
+        if self.game.finished and self.game.winning_hand_count:
+            await self._send_rewards(interaction)
+
+    @discord.ui.button(label="Split", style=discord.ButtonStyle.secondary, row=1)
+    async def split_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self.game.split():
+            await interaction.response.send_message(
+                "Split is not available right now.", ephemeral=True
+            )
+            return
+
+        self._update_buttons()
+
+        await interaction.response.edit_message(
+            content=self.game.render_state(reveal_dealer=False),
+            view=self,
+        )
 
 
 def _collect_assignees(*members: Optional[discord.Member]) -> List[discord.Member]:
@@ -265,7 +374,7 @@ async def mai(ctx: commands.Context) -> None:
     # If blackjack is dealt immediately, resolve without buttons.
     if game.finished:
         await ctx.send(game.render_state(reveal_dealer=True))
-        if game.player_won:
+        for _ in range(game.winning_hand_count):
             await ctx.send(random.choice(GOON_PHRASES))
         return
 
