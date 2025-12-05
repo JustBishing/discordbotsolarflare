@@ -301,10 +301,6 @@ class BlackjackView(discord.ui.View):
             else:
                 child.disabled = False
 
-    async def _send_rewards(self, interaction: discord.Interaction) -> None:
-        for _ in range(self.game.winning_hand_count):
-            await interaction.followup.send(random.choice(GOON_PHRASES))
-
     @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
     async def hit(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -318,9 +314,6 @@ class BlackjackView(discord.ui.View):
             view=self,
         )
 
-        if self.game.finished and self.game.winning_hand_count:
-            await self._send_rewards(interaction)
-
     @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
     async def stand(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -332,9 +325,6 @@ class BlackjackView(discord.ui.View):
             content=self.game.render_state(reveal_dealer=self.game.finished),
             view=self,
         )
-
-        if self.game.finished and self.game.winning_hand_count:
-            await self._send_rewards(interaction)
 
     @discord.ui.button(label="Split", style=discord.ButtonStyle.secondary, row=1)
     async def split_button(
@@ -387,8 +377,6 @@ async def blackjack(ctx: commands.Context) -> None:
     # If blackjack is dealt immediately, resolve without buttons.
     if game.finished:
         await ctx.send(game.render_state(reveal_dealer=True))
-        for _ in range(game.winning_hand_count):
-            await ctx.send(random.choice(GOON_PHRASES))
         return
 
     view = BlackjackView(game, ctx.author)
