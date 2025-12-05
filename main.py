@@ -680,12 +680,53 @@ async def leaderboard(ctx: commands.Context) -> None:
 
     top = sorted(balances.items(), key=lambda item: item[1], reverse=True)[:10]
     lines = []
+    guild = ctx.guild
     for idx, (user_id, amount) in enumerate(top, start=1):
-        member = ctx.guild.get_member(int(user_id)) if ctx.guild else None
-        name = member.display_name if member else f"User {user_id}"
+        name = f"User {user_id}"
+        if guild:
+            member = guild.get_member(int(user_id))
+            if not member:
+                try:
+                    member = await guild.fetch_member(int(user_id))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+            if member:
+                name = member.display_name
         lines.append(f"{idx}. {name}: ${amount}")
 
     await ctx.send("Top balances:\n" + "\n".join(lines))
+
+
+@BOT.command(name="balance", help="Show your wallet balance.")
+async def balance(ctx: commands.Context) -> None:
+    """Display the caller's wallet balance."""
+    user_id = ctx.author.id
+    WALLETS.ensure_user(user_id)
+    balance = WALLETS.get_balance(user_id)
+    await ctx.send(f"Your balance: ${balance}.")
+
+
+ADMIN_USER_ID = 722860021364293735
+
+
+@BOT.command(name="givemoney", help="Admin-only: give money to a user.")
+async def givemoney(
+    ctx: commands.Context, member: discord.Member, amount: int
+) -> None:
+    """Transfer money to a user; restricted to the admin user ID."""
+    if ctx.author.id != ADMIN_USER_ID:
+        await ctx.send("You do not have permission to use this command.")
+        return
+
+    if amount <= 0:
+        await ctx.send("Amount must be greater than 0.")
+        return
+
+    WALLETS.ensure_user(member.id)
+    new_balance = WALLETS.adjust_balance(member.id, amount)
+    await ctx.send(
+        f"Gave ${amount} to {member.display_name}. New balance: ${new_balance}."
+    )
 
 
 @BOT.tree.command(
