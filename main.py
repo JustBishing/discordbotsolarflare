@@ -12,17 +12,32 @@ from discord.ext import commands
 
 
 INTENTS = discord.Intents.default()
+INTENTS.message_content = True  # Required for prefix commands like !mai
 BOT = commands.Bot(command_prefix="!", intents=INTENTS)
-GOON_PHRASES = [
-    "https://tenor.com/view/mai-sakurajima-besto-waifui-luis301408-gif-22787686",
-    "https://tenor.com/view/sakuta-azusagawa-mai-sakurajima-seishun-buta-yarou-wa-bunny-girl-senpai-no-yume-wo-minai-rascal-does-not-dream-funny-gif-2946009759168864042",
-    "https://tenor.com/view/mai-sakurajima-anime-anime-girl-hug-bunny-girl-senpai-gif-3880306402977192551",
-    "https://tenor.com/view/%D0%B7%D0%B0%D0%B9%D1%87%D0%B8%D0%BA-gif-21592153",
-    "https://tenor.com/view/bunny-girl-senpai-mai-sakurajima-sakurajima-mai-gif-5717527464255844686",
-    "https://tenor.com/view/rascal-does-not-dream-of-a-knapsack-kid-mai-sakurajima-buta-yarou-waking-up-gif-8618623992027128015",
-    "https://tenor.com/view/mai-sakurajima-mai-bunny-girl-senpai-anime-cute-gif-17907056",
-    "https://tenor.com/view/mai-sakurajima-bunny-girl-senpai-gif-24086478"
+
+DEFAULT_GOON_PHRASES = [
+    "Good boy"
 ]
+
+
+def _load_goon_phrases(file_name: str = "mai_gifs.txt") -> List[str]:
+    """Load goon phrases from a text file, falling back to defaults on error."""
+    file_path = os.path.join(os.path.dirname(__file__), file_name)
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            phrases = [line.strip() for line in handle if line.strip()]
+    except OSError as error:
+        print(f"Could not read goon phrases from {file_path}: {error}")
+        return DEFAULT_GOON_PHRASES.copy()
+
+    if not phrases:
+        print(f"No goon phrases found in {file_path}; using defaults.")
+        return DEFAULT_GOON_PHRASES.copy()
+
+    return phrases
+
+
+GOON_PHRASES = _load_goon_phrases()
 
 
 def _collect_assignees(*members: Optional[discord.Member]) -> List[discord.Member]:
@@ -37,10 +52,10 @@ async def on_ready() -> None:
     print(f"Logged in as {BOT.user} (ID: {BOT.user.id})")
 
 
-@BOT.tree.command(name="goon", description="Send a random goon message.")
-async def goon(interaction: discord.Interaction) -> None:
-    """Respond with a random mai gif"""
-    await interaction.response.send_message(random.choice(GOON_PHRASES))
+@BOT.command(name="mai", help="Send a random goon message.")
+async def mai(ctx: commands.Context) -> None:
+    """Respond with a random goon phrase via the !mai prefix command."""
+    await ctx.send(random.choice(GOON_PHRASES))
 
 
 @BOT.tree.command(
