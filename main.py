@@ -904,13 +904,9 @@ async def slash_mai(interaction: discord.Interaction) -> None:
     member = interaction.user
     has_role = any(role.name == required_role for role in getattr(member, "roles", []))
     if not has_role:
-        await interaction.response.send_message(
-            "you arent a good enough boy", ephemeral=True
-        )
+        await interaction.response.send_message("you arent a good enough boy")
         return
-    await interaction.response.send_message(
-        random.choice(GOON_PHRASES), ephemeral=True
-    )
+    await interaction.response.send_message(random.choice(GOON_PHRASES))
 
 
 @BOT.tree.command(name="balance", description="Show your wallet balance.")
@@ -927,7 +923,7 @@ async def slash_balance(interaction: discord.Interaction) -> None:
 async def slash_leaderboard(interaction: discord.Interaction) -> None:
     balances = WALLETS.all_balances()
     if not balances:
-        await interaction.response.send_message("No wallets yet.")
+        await interaction.response.send_message("No wallets yet.", ephemeral=True)
         return
 
     top = sorted(balances.items(), key=lambda item: item[1], reverse=True)[:10]
@@ -936,7 +932,9 @@ async def slash_leaderboard(interaction: discord.Interaction) -> None:
         name = await _display_name_from_id(interaction.guild, int(user_id))
         lines.append(f"{idx}. {name}: ${amount}")
 
-    await interaction.response.send_message("Top balances:\n" + "\n".join(lines))
+    await interaction.response.send_message(
+        "Top balances:\n" + "\n".join(lines), ephemeral=True
+    )
 
 
 @BOT.tree.command(name="givemoney", description="Admin-only: give money to a user.")
@@ -957,7 +955,8 @@ async def slash_givemoney(
     WALLETS.ensure_user(member.id)
     new_balance = WALLETS.adjust_balance(member.id, amount)
     await interaction.response.send_message(
-        f"Gave ${amount} to {member.display_name}. New balance: ${new_balance}."
+        f"Gave ${amount} to {member.display_name}. New balance: ${new_balance}.",
+        ephemeral=True,
     )
 
 
