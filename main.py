@@ -551,12 +551,19 @@ class BetSelectionView(discord.ui.View):
     """Bet chooser that then starts blackjack."""
 
     def __init__(
-        self, user: discord.Member, balance: int, ctx: commands.Context
+        self,
+        user: discord.Member,
+        balance: int,
+        ctx: Optional[commands.Context],
+        use_dm: bool = False,
+        ephemeral: bool = False,
     ) -> None:
         super().__init__(timeout=60)
         self.user_id = user.id
         self.balance = balance
         self.ctx = ctx
+        self.use_dm = use_dm
+        self.ephemeral = ephemeral
         self.message: Optional[discord.Message] = None
         self.add_item(BetSelect(self, balance))
 
@@ -620,11 +627,103 @@ class BetSelectionView(discord.ui.View):
             return
 
         view = BlackjackView(game, interaction.user, WALLETS)
-        message = await interaction.followup.send(
-            game.render_state(reveal_dealer=False), view=view
+        # Send the game in DM if we started there, otherwise reply in-channel.
+        if self.use_dm:
+            dm = interaction.user.dm_channel or await interaction.user.create_dm()
+            msg = await dm.send(
+                game.render_state(reveal_dealer=False), view=view
+            )
+        else:
+            msg = await interaction.followup.send(
+                game.render_state(reveal_dealer=False),
+                view=view,
+                ephemeral=self.ephemeral,
+            )
+        view.message = msg
+        self.message = msg
+
+
+class CoinFlipView(discord.ui.View):
+    """Guess coin flips; win after a streak."""
+
+    def __init__(self, user: discord.Member) -> None:
+        super().__init__(timeout=60)
+        self.user_id = user.id
+        self.streak = 0
+        self.finished = False
+        self.message: Optional[discord.Message] = None
+        self.status = "Guess heads or tails. Need 5 in a row to earn $500."
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This game isn't for you.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        if self.message and not self.finished:
+            for child in self.children:
+                child.disabled = True
+            try:
+                await self.message.edit(
+                    content=f"{self.status}\n\nTimed out.", view=self
+                )
+            except discord.HTTPException:
+                pass
+
+    def _flip(self) -> str:
+        return random.choice(["heads", "tails"])
+
+    def _result_text(self) -> str:
+        return f"{self.status}\nCurrent streak: {self.streak}/{COIN_TARGET}"
+
+    async def _handle_guess(
+        self, interaction: discord.Interaction, guess: str
+    ) -> None:
+        if self.finished:
+            await interaction.response.send_message(
+                "Game already finished.", ephemeral=True
+            )
+            return
+        outcome = self._flip()
+        if guess == outcome:
+            self.streak += 1
+            self.status = f"Correct! It was {outcome}."
+            if self.streak >= COIN_TARGET:
+                self.finished = True
+                for child in self.children:
+                    child.disabled = True
+                WALLETS.adjust_balance(self.user_id, COIN_REWARD)
+                self.status += (
+                    f" You earned ${COIN_REWARD}. New balance: "
+                    f"${WALLETS.get_balance(self.user_id)}."
+                )
+                await interaction.response.edit_message(
+                    content=self._result_text(), view=self
+                )
+                return
+        else:
+            self.streak = 0
+            self.status = (
+                f"Wrong, it was {outcome}. Streak reset. Try again!"
+            )
+        await interaction.response.edit_message(
+            content=self._result_text(), view=self
         )
-        view.message = message
-        self.message = message
+
+    @discord.ui.button(label="Heads", style=discord.ButtonStyle.primary)
+    async def heads(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._handle_guess(interaction, "heads")
+
+    @discord.ui.button(label="Tails", style=discord.ButtonStyle.secondary)
+    async def tails(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._handle_guess(interaction, "tails")
 
 
 def _collect_assignees(*members: Optional[discord.Member]) -> List[discord.Member]:
@@ -662,12 +761,21 @@ async def blackjack(ctx: commands.Context) -> None:
         await ctx.send("You are out of funds. No bets available.")
         return
 
-    view = BetSelectionView(ctx.author, balance, ctx)
-    message = await ctx.send(
-        f"Balance: ${balance}. Choose your bet to start blackjack.",
-        view=view,
-    )
-    view.message = message
+    # Try to keep games out of public channels by DM'ing the selection; fall back to channel if DMs closed.
+    try:
+        dm_message = await ctx.author.send(
+            f"Balance: ${balance}. Choose your bet to start blackjack (DM).",
+            view=(view := BetSelectionView(ctx.author, balance, ctx, use_dm=True)),
+        )
+        view.message = dm_message
+        await ctx.send("Check your DMs to start blackjack.")
+    except discord.Forbidden:
+        view = BetSelectionView(ctx.author, balance, ctx)
+        message = await ctx.send(
+            f"Balance: ${balance}. Choose your bet to start blackjack here.",
+            view=view,
+        )
+        view.message = message
 
 
 @BOT.command(name="leaderboard", help="Show top wallet balances.")
@@ -707,6 +815,8 @@ async def balance(ctx: commands.Context) -> None:
 
 
 ADMIN_USER_ID = 722860021364293735
+COIN_TARGET = 5
+COIN_REWARD = 500
 
 
 @BOT.command(name="givemoney", help="Admin-only: give money to a user.")
@@ -727,6 +837,194 @@ async def givemoney(
     await ctx.send(
         f"Gave ${amount} to {member.display_name}. New balance: ${new_balance}."
     )
+
+
+@BOT.command(name="transfer", help="Transfer money to another user.")
+async def transfer(ctx: commands.Context, member: discord.Member, amount: int) -> None:
+    """Allow users to transfer funds between wallets."""
+    if amount <= 0:
+        await ctx.send("Amount must be greater than 0.")
+        return
+
+    sender_id = ctx.author.id
+    recipient_id = member.id
+    if sender_id == recipient_id:
+        await ctx.send("You cannot transfer money to yourself.")
+        return
+
+    WALLETS.ensure_user(sender_id)
+    WALLETS.ensure_user(recipient_id)
+    balance = WALLETS.get_balance(sender_id)
+    if amount > balance:
+        await ctx.send(f"Insufficient funds. Your balance: ${balance}.")
+        return
+
+    WALLETS.adjust_balance(sender_id, -amount)
+    new_balance = WALLETS.adjust_balance(recipient_id, amount)
+    await ctx.send(
+        f"Transferred ${amount} to {member.display_name}. "
+        f"Your new balance: ${WALLETS.get_balance(sender_id)}. "
+        f"{member.display_name}'s balance: ${new_balance}."
+    )
+
+
+@BOT.command(name="getmoney", help="Guess 5 coin flips in a row to earn $500.")
+async def getmoney(ctx: commands.Context) -> None:
+    """Coin flip streak game to earn a reward."""
+    user_id = ctx.author.id
+    WALLETS.ensure_user(user_id)
+
+    view = CoinFlipView(ctx.author)
+    message = await ctx.send(view._result_text(), view=view)
+    view.message = message
+
+
+# ---------------- Slash command equivalents ----------------
+
+
+async def _display_name_from_id(
+    guild: Optional[discord.Guild], user_id: int
+) -> str:
+    name = f"User {user_id}"
+    if guild:
+        member = guild.get_member(user_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+        if member:
+            name = member.display_name
+    return name
+
+
+@BOT.tree.command(name="mai", description="Send a goon phrase (Mai Sakurajima role required).")
+async def slash_mai(interaction: discord.Interaction) -> None:
+    required_role = "Mai Sakurajima"
+    member = interaction.user
+    has_role = any(role.name == required_role for role in getattr(member, "roles", []))
+    if not has_role:
+        await interaction.response.send_message(
+            "you arent a good enough boy", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        random.choice(GOON_PHRASES), ephemeral=True
+    )
+
+
+@BOT.tree.command(name="balance", description="Show your wallet balance.")
+async def slash_balance(interaction: discord.Interaction) -> None:
+    user_id = interaction.user.id
+    WALLETS.ensure_user(user_id)
+    balance = WALLETS.get_balance(user_id)
+    await interaction.response.send_message(
+        f"Your balance: ${balance}.", ephemeral=True
+    )
+
+
+@BOT.tree.command(name="leaderboard", description="Show top wallet balances.")
+async def slash_leaderboard(interaction: discord.Interaction) -> None:
+    balances = WALLETS.all_balances()
+    if not balances:
+        await interaction.response.send_message("No wallets yet.")
+        return
+
+    top = sorted(balances.items(), key=lambda item: item[1], reverse=True)[:10]
+    lines = []
+    for idx, (user_id, amount) in enumerate(top, start=1):
+        name = await _display_name_from_id(interaction.guild, int(user_id))
+        lines.append(f"{idx}. {name}: ${amount}")
+
+    await interaction.response.send_message("Top balances:\n" + "\n".join(lines))
+
+
+@BOT.tree.command(name="givemoney", description="Admin-only: give money to a user.")
+@app_commands.describe(member="User to receive money", amount="Amount to give")
+async def slash_givemoney(
+    interaction: discord.Interaction, member: discord.Member, amount: int
+) -> None:
+    if interaction.user.id != ADMIN_USER_ID:
+        await interaction.response.send_message(
+            "You do not have permission to use this command.", ephemeral=True
+        )
+        return
+    if amount <= 0:
+        await interaction.response.send_message(
+            "Amount must be greater than 0.", ephemeral=True
+        )
+        return
+    WALLETS.ensure_user(member.id)
+    new_balance = WALLETS.adjust_balance(member.id, amount)
+    await interaction.response.send_message(
+        f"Gave ${amount} to {member.display_name}. New balance: ${new_balance}."
+    )
+
+
+@BOT.tree.command(name="transfer", description="Transfer money to another user.")
+@app_commands.describe(member="User to receive money", amount="Amount to transfer")
+async def slash_transfer(
+    interaction: discord.Interaction, member: discord.Member, amount: int
+) -> None:
+    if amount <= 0:
+        await interaction.response.send_message(
+            "Amount must be greater than 0.", ephemeral=True
+        )
+        return
+    sender_id = interaction.user.id
+    recipient_id = member.id
+    if sender_id == recipient_id:
+        await interaction.response.send_message(
+            "You cannot transfer money to yourself.", ephemeral=True
+        )
+        return
+    WALLETS.ensure_user(sender_id)
+    WALLETS.ensure_user(recipient_id)
+    balance = WALLETS.get_balance(sender_id)
+    if amount > balance:
+        await interaction.response.send_message(
+            f"Insufficient funds. Your balance: ${balance}.", ephemeral=True
+        )
+        return
+    WALLETS.adjust_balance(sender_id, -amount)
+    new_balance = WALLETS.adjust_balance(recipient_id, amount)
+    await interaction.response.send_message(
+        f"Transferred ${amount} to {member.display_name}. "
+        f"Your new balance: ${WALLETS.get_balance(sender_id)}. "
+        f"{member.display_name}'s balance: ${new_balance}.",
+        ephemeral=True,
+    )
+
+
+@BOT.tree.command(name="getmoney", description="Guess 5 coin flips in a row to earn $500.")
+async def slash_getmoney(interaction: discord.Interaction) -> None:
+    user_id = interaction.user.id
+    WALLETS.ensure_user(user_id)
+    view = CoinFlipView(interaction.user)
+    await interaction.response.send_message(
+        view._result_text(), view=view, ephemeral=True
+    )
+    view.message = await interaction.original_response()
+
+
+@BOT.tree.command(name="blackjack", description="Play blackjack; choose your bet.")
+async def slash_blackjack(interaction: discord.Interaction) -> None:
+    user_id = interaction.user.id
+    WALLETS.ensure_user(user_id)
+    balance = WALLETS.get_balance(user_id)
+    if balance <= 0:
+        await interaction.response.send_message(
+            "You are out of funds. No bets available.", ephemeral=True
+        )
+        return
+
+    view = BetSelectionView(interaction.user, balance, None, use_dm=False, ephemeral=True)
+    await interaction.response.send_message(
+        f"Balance: ${balance}. Choose your bet to start blackjack.",
+        view=view,
+        ephemeral=True,
+    )
+    view.message = await interaction.original_response()
 
 
 @BOT.tree.command(
